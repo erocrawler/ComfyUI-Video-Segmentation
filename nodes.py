@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import folder_paths
 import numpy as np
@@ -440,8 +441,23 @@ class TransNetV2_Run:
         """
         Create video segments from exact frame boundaries.
         Uses ffmpeg trim/atrim filters instead of -ss/-to seeking to avoid frame loss on CFR input.
+        Audio is aligned using matching time boundaries derived from frame indices and fps.
         """
+        import subprocess
+
         segment_paths = []
+        no_audio_error_patterns = (
+            re.compile(r"Stream specifier ':a'.*(matches no streams|does not match any streams)", re.IGNORECASE),
+            re.compile(r"matches no streams", re.IGNORECASE),
+        )
+        
+        def run_ffmpeg(cmd):
+            return subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False
+            )
         
         try:
             if fps <= 0:
@@ -455,7 +471,7 @@ class TransNetV2_Run:
                     continue
 
                 # Create output filename
-                segment_filename = f"segment_{i+1:03d}.mp4"
+                segment_filename = f"segment_{len(segment_paths) + 1:03d}.mp4"
                 segment_path = os.path.join(output_dir, segment_filename)
                 
                 # end_frame is exclusive; this keeps exactly (end_frame - start_frame) video frames.
@@ -486,7 +502,8 @@ class TransNetV2_Run:
                         (
                             f"[0:v]trim=start_frame={start_frame}:end_frame={end_frame},"
                             f"setpts=PTS-STARTPTS[v];"
-                            f"[0:a]atrim=start={start_time:.12f}:end={end_time:.12f},"
+                            # Audio does not use frame indices; trim with matching time boundaries.
+                            f"[0:a]atrim=start={start_time:.9f}:end={end_time:.9f},"
                             f"asetpts=PTS-STARTPTS[a]"
                         ),
                         '-map', '[v]',
@@ -495,25 +512,21 @@ class TransNetV2_Run:
                         segment_path
                     ]
 
-                    def _run_ffmpeg(cmd):
-                        return subprocess.run(
-                            cmd,
-                            capture_output=True,
-                            text=True,
-                            check=False
-                        )
-
-                    result = _run_ffmpeg(ffmpeg_cmd)
+                    result = run_ffmpeg(ffmpeg_cmd)
+                    stderr_text = result.stderr or ""
 
                     # Some videos have no audio stream - retry with video-only trim if needed.
-                    if result.returncode != 0 and "Stream specifier ':a'" in result.stderr:
-                        logger.info(f"Segment {i+1}: input has no audio stream, creating video-only segment")
+                    if result.returncode != 0 and any(pattern.search(stderr_text) for pattern in no_audio_error_patterns):
+                        logger.info(
+                            f"Segment {i+1}: ffmpeg reported missing audio stream; "
+                            f"retrying video-only. Original error: {stderr_text.strip()}"
+                        )
                         ffmpeg_cmd = base_ffmpeg_cmd + [
                             '-vf',
                             f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS",
                             segment_path
                         ]
-                        result = _run_ffmpeg(ffmpeg_cmd)
+                        result = run_ffmpeg(ffmpeg_cmd)
 
                     # Check if command succeeded and file exists
                     if result.returncode == 0 and os.path.exists(segment_path):
