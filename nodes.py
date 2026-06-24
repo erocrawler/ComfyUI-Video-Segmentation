@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import folder_paths
 import numpy as np
@@ -411,13 +412,28 @@ class TransNetV2_Run:
                 scenes.append([start, i])
             t_prev = t
             
-        # Handle the last scene
+        # Handle the last frames
         if t == 0:  # If last prediction is not a scene boundary
             scenes.append([start, len(predictions_binary)])
+        elif t == 1:  # Last frames are boundary frames - include them in the last scene
+            if scenes:
+                scenes[-1][1] = len(predictions_binary)
+            else:
+                scenes.append([0, len(predictions_binary)])
         
         # Handle case where all predictions are scene boundaries
         if len(scenes) == 0:
             return [(0, len(predictions_binary))]
+        
+        # Close gaps caused by boundary frames being excluded from both adjacent scenes.
+        # Boundary frames are assigned to the preceding scene by extending its end to
+        # where the next scene begins, so no frames are dropped between segments.
+        for j in range(len(scenes) - 1):
+            scenes[j][1] = scenes[j + 1][0]
+        
+        # Ensure coverage starts at frame 0 in case of leading boundary frames.
+        if scenes[0][0] > 0:
+            scenes[0][0] = 0
         
         # Apply minimum scene length filtering
         filtered_scenes = []
@@ -438,55 +454,105 @@ class TransNetV2_Run:
 
     def _create_video_segments(self, video_path, scenes, output_dir, fps):
         """
-        Create video segments based on scene boundaries using ffmpeg subprocess to preserve audio.
+        Create video segments from exact frame boundaries.
+        Uses ffmpeg trim/atrim filters instead of -ss/-to seeking to avoid frame loss on CFR input.
+        Audio is aligned using matching time boundaries derived from frame indices and fps.
         """
         import subprocess
-        
+
         segment_paths = []
+        no_audio_error_patterns = (
+            re.compile(r"Stream specifier ':a'.*(matches no streams|does not match any streams)", re.IGNORECASE),
+            re.compile(r"matches no streams", re.IGNORECASE),
+        )
+        
+        def run_ffmpeg(cmd):
+            return subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False
+            )
         
         try:
+            if fps <= 0:
+                raise ValueError(f"Invalid FPS value for segmentation: {fps}")
+
             for i, (start_frame, end_frame) in enumerate(scenes):
+                if end_frame <= start_frame:
+                    logger.warning(
+                        f"Skipping segment {i+1}: invalid frame range {start_frame}-{end_frame}"
+                    )
+                    continue
+
                 # Create output filename
-                segment_filename = f"segment_{i+1:03d}.mp4"
+                segment_filename = f"segment_{len(segment_paths) + 1:03d}.mp4"
                 segment_path = os.path.join(output_dir, segment_filename)
                 
-                # Calculate time-based start and end times
-                # Note: end_time is exclusive in both moviepy and ffmpeg -to parameter
+                # end_frame is exclusive; this keeps exactly (end_frame - start_frame) video frames.
                 start_time = start_frame / fps
-                end_time = end_frame / fps  # ffmpeg -to parameter is exclusive, matching moviepy's subclip behavior
+                end_time = end_frame / fps
+                expected_frames = end_frame - start_frame
                 
-                logger.info(f"Creating segment {i+1}: frames {start_frame}-{end_frame-1} (inclusive), time {start_time:.2f}s-{end_time:.2f}s")
+                logger.info(
+                    f"Creating segment {i+1}: frames {start_frame}-{end_frame-1} "
+                    f"(expected {expected_frames} frames), "
+                    f"time {start_time:.6f}s-{end_time:.6f}s"
+                )
                 
-                # Use ffmpeg subprocess to extract segment with audio preservation
+                # Use trim filters for frame-accurate boundaries and reset timestamps for clean segment outputs.
                 try:
-                    ffmpeg_cmd = [
+                    base_ffmpeg_cmd = [
                         'ffmpeg',
-                        '-y',  # Overwrite output files
-                        '-ss', str(start_time),  # Start time
-                        '-to', str(end_time),    # End time (exclusive)
-                        '-i', video_path,        # Input file
-                        '-c:v', 'libx264',       # Video codec
-                        '-c:a', 'aac',           # Audio codec
-                        '-preset', 'fast',       # Encoding speed
-                        '-crf', '23',            # Quality (lower = better)
-                        segment_path             # Output file
+                        '-y',                       # Overwrite output files
+                        '-i', video_path,           # Input file
+                        '-c:v', 'libx264',          # Video codec
+                        '-preset', 'fast',          # Encoding speed
+                        '-crf', '23',               # Quality (lower = better)
+                        '-movflags', '+faststart',  # Better MP4 playback compatibility
                     ]
-                    
-                    # Run ffmpeg command
-                    result = subprocess.run(
-                        ffmpeg_cmd,
-                        capture_output=True,
-                        text=True,
-                        check=False  # Don't raise exception on non-zero exit
-                    )
-                    
+
+                    ffmpeg_cmd = base_ffmpeg_cmd + [
+                        '-filter_complex',
+                        (
+                            f"[0:v]trim=start_frame={start_frame}:end_frame={end_frame},"
+                            f"setpts=PTS-STARTPTS[v];"
+                            # Audio does not use frame indices; trim with matching time boundaries.
+                            f"[0:a]atrim=start={start_time:.9f}:end={end_time:.9f},"
+                            f"asetpts=PTS-STARTPTS[a]"
+                        ),
+                        '-map', '[v]',
+                        '-map', '[a]',
+                        '-c:a', 'aac',              # Audio codec
+                        segment_path
+                    ]
+
+                    result = run_ffmpeg(ffmpeg_cmd)
+                    stderr_text = result.stderr or ""
+
+                    # Some videos have no audio stream - retry with video-only trim if needed.
+                    if result.returncode != 0 and any(pattern.search(stderr_text) for pattern in no_audio_error_patterns):
+                        logger.info(
+                            f"Segment {i+1}: ffmpeg reported missing audio stream; "
+                            f"retrying video-only. Original error: {stderr_text.strip()}"
+                        )
+                        ffmpeg_cmd = base_ffmpeg_cmd + [
+                            '-vf',
+                            f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS",
+                            segment_path
+                        ]
+                        result = run_ffmpeg(ffmpeg_cmd)
+
                     # Check if command succeeded and file exists
                     if result.returncode == 0 and os.path.exists(segment_path):
                         # Get absolute path
                         abs_segment_path = os.path.abspath(segment_path)
                         segment_paths.append(abs_segment_path)
                         
-                        logger.info(f"✅ Created segment {i+1}: {abs_segment_path} (duration: {end_time - start_time:.2f}s)")
+                        logger.info(
+                            f"✅ Created segment {i+1}: {abs_segment_path} "
+                            f"(duration: {end_time - start_time:.6f}s, expected_frames={expected_frames})"
+                        )
                     else:
                         logger.error(f"❌ Failed to create segment {i+1}:")
                         logger.error(f"   Return code: {result.returncode}")
