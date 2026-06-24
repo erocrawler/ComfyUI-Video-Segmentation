@@ -412,13 +412,28 @@ class TransNetV2_Run:
                 scenes.append([start, i])
             t_prev = t
             
-        # Handle the last scene
+        # Handle the last frames
         if t == 0:  # If last prediction is not a scene boundary
             scenes.append([start, len(predictions_binary)])
+        elif t == 1:  # Last frames are boundary frames - include them in the last scene
+            if scenes:
+                scenes[-1][1] = len(predictions_binary)
+            else:
+                scenes.append([0, len(predictions_binary)])
         
         # Handle case where all predictions are scene boundaries
         if len(scenes) == 0:
             return [(0, len(predictions_binary))]
+        
+        # Close gaps caused by boundary frames being excluded from both adjacent scenes.
+        # Boundary frames are assigned to the preceding scene by extending its end to
+        # where the next scene begins, so no frames are dropped between segments.
+        for j in range(len(scenes) - 1):
+            scenes[j][1] = scenes[j + 1][0]
+        
+        # Ensure coverage starts at frame 0 in case of leading boundary frames.
+        if scenes[0][0] > 0:
+            scenes[0][0] = 0
         
         # Apply minimum scene length filtering
         filtered_scenes = []
